@@ -10,20 +10,15 @@ const GAP = 4;           // px — matches Tailwind gap-1
 const STEP = ROW_HEIGHT + GAP; // 74 px per symbol slot
 const VISIBLE_H = 3 * ROW_HEIGHT + 2 * GAP; // 218 px — height of the visible window
 
-// Number of random symbol rows appended below the finals in the reel strip.
-// The strip starts at a large negative offset that makes these randoms visible;
-// the CSS transition then slides the strip DOWN until y=0 reveals the finals.
+// Number of random symbol rows scrolled through during each spin.
 const RANDOM_ROWS = 14; // 14 rows × 3 symbols = 42 extra symbols per reel
 
-// Starting translateY: positions the strip so the bottom randoms fill the window.
-// Strip layout (top → bottom): [final0, final1, final2, rand_0 … rand_(N-1)]
-// translateY(0)          → window sees final0/final1/final2 (landing position)
-// translateY(START_Y)    → window sees the last 3 randoms   (spin start)
-const START_Y = -(RANDOM_ROWS * 3 * STEP); // e.g. -(14 × 3 × 74) = -3108 px
+// Spin duration per reel in ms. Each reel slides for exactly 2 seconds.
+const SPIN_DURATION = 2000;
 
-// Per-reel CSS transition durations (ms). Reel 0 stops first, reel 4 last,
-// producing a natural cascading "one by one" stop sequence.
-const REEL_DURATIONS = [1200, 1500, 1800, 2100, 2400] as const;
+// Stagger delay between consecutive reel starts (ms), producing a natural
+// cascading "one by one" stop sequence: reel 0 stops first, reel 4 last.
+const REEL_STAGGER = 200;
 
 // Strong ease-out curve: starts very fast (slot-machine blur), decelerates
 // smoothly to rest with no bounce.
@@ -74,6 +69,9 @@ export default function ReelGrid({
     Array.from({ length: 5 }, (_, i) => makeIdle(grid, i))
   );
   const timeouts = useRef<ReturnType<typeof setTimeout>[]>([]);
+  // Tracks the grid that was last displayed so each spin can start from it
+  // rather than jumping to a random position.
+  const prevGridRef = useRef<ReelGridType>(grid);
 
   // Build the set of winning cell positions for highlighting
   const winPositions = new Set<string>();
@@ -89,59 +87,73 @@ export default function ReelGrid({
     timeouts.current = [];
 
     if (!spinning) {
+      // Record the grid now on display so the next spin can start from it
+      prevGridRef.current = grid;
       setReels(Array.from({ length: 5 }, (_, i) => makeIdle(grid, i)));
       return;
     }
 
-    // ── Step 1: Instantly jump all reels to START_Y (no transition) ──────────
-    // Each strip has the final symbols at the top and random symbols below.
-    // translateY(START_Y) makes the window show the bottom randoms.
+    // Strip layout (top → bottom):
+    //   [new_final0, new_final1, new_final2,  rand_0 … rand_N-1,  prev_final0, prev_final1, prev_final2]
+    //
+    // translateY(0)        → window sees new finals  (landing position)
+    // translateY(START_Y)  → window sees prev finals (seamless spin start)
+    //
+    // The transition slides the strip UP (START_Y → 0) so the visible window
+    // scrolls through: prev finals → randoms → new finals.
+    const START_Y = -((RANDOM_ROWS * 3 + 3) * STEP);
+
+    // ── Step 1: Instantly position all reels to show the previous finals ──────
+    // Because START_Y lands on prev_final0/1/2, the visual is identical to the
+    // idle state — no jump.
     setReels(
       Array.from({ length: 5 }, (_, r) => ({
         phase: 'sliding' as Phase,
         strip: [
-          ...grid[r],
-          ...Array.from({ length: RANDOM_ROWS * 3 }, () => randSym(r)),
+          ...grid[r],                                                   // new finals (top)
+          ...Array.from({ length: RANDOM_ROWS * 3 }, () => randSym(r)), // random filler
+          ...prevGridRef.current[r],                                    // prev finals (bottom)
         ],
         y: START_Y,
         transition: 'none',
       }))
     );
 
-    // ── Step 2: After one render cycle, start each reel's CSS transition ─────
-    // All reels begin sliding simultaneously but each has a different duration,
-    // so they stop one by one in a natural cascade.
-    const t1 = setTimeout(() => {
-      setReels(prev =>
-        prev.map((s, i) => ({
-          ...s,
-          y: 0, // slide the strip DOWN until finals (top of strip) are visible
-          transition: `transform ${REEL_DURATIONS[i]}ms ${EASING}`,
-        }))
-      );
-    }, 30); // single rAF-equivalent delay so the initial position is committed
-    timeouts.current.push(t1);
-
-    // ── Step 3: Mark each reel done after its transition completes ───────────
+    // ── Step 2: Start each reel's CSS transition with a staggered delay ───────
+    // Reel 0 starts first and stops first; reel 4 starts last and stops last.
+    // Each reel slides for exactly SPIN_DURATION ms.
     for (let r = 0; r < 5; r++) {
-      const t = setTimeout(
-        () => {
-          setReels(prev => {
-            const next = [...prev];
-            next[r] = { ...next[r], phase: 'done', transition: 'none' };
-            return next;
-          });
-        },
-        30 + REEL_DURATIONS[r] + 50 // render delay + transition + small buffer
-      );
+      const startDelay = 30 + r * REEL_STAGGER; // 30 ms for React to commit step 1
+      const t = setTimeout(() => {
+        setReels(prev => {
+          const next = [...prev];
+          next[r] = {
+            ...next[r],
+            y: 0,
+            transition: `transform ${SPIN_DURATION}ms ${EASING}`,
+          };
+          return next;
+        });
+      }, startDelay);
       timeouts.current.push(t);
     }
 
-    // ── Step 4: Notify parent when all reels have landed ────────────────────
-    const tDone = setTimeout(
-      () => onSpinComplete?.(),
-      30 + Math.max(...REEL_DURATIONS) + 100
-    );
+    // ── Step 3: Mark each reel done after its transition completes ───────────
+    for (let r = 0; r < 5; r++) {
+      const doneDelay = 30 + r * REEL_STAGGER + SPIN_DURATION + 50;
+      const t = setTimeout(() => {
+        setReels(prev => {
+          const next = [...prev];
+          next[r] = { ...next[r], phase: 'done', transition: 'none' };
+          return next;
+        });
+      }, doneDelay);
+      timeouts.current.push(t);
+    }
+
+    // ── Step 4: Notify parent when the last reel has landed ──────────────────
+    const lastReelDone = 30 + 4 * REEL_STAGGER + SPIN_DURATION + 100;
+    const tDone = setTimeout(() => onSpinComplete?.(), lastReelDone);
     timeouts.current.push(tDone);
 
     return () => timeouts.current.forEach(clearTimeout);

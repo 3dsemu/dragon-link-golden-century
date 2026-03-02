@@ -9,12 +9,25 @@ const ROW_HEIGHT = 70;   // px — matches the original cell height
 const GAP = 4;           // px — matches Tailwind gap-1
 const STEP = ROW_HEIGHT + GAP; // 74 px per symbol slot
 const VISIBLE_H = 3 * ROW_HEIGHT + 2 * GAP; // 218 px — height of the visible window
-const SLIDE_Y = 3 * STEP; // 222 px — distance the strip must travel to go from randoms → finals
 
-// Strip layout (top → bottom):
-//   [rand0, rand1, rand2,  final0, final1, final2]
-// translateY(0)    → window sees rand0/rand1/rand2 (spinning symbols)
-// translateY(-222) → window sees final0/final1/final2 (result symbols)
+// Number of random symbol rows appended below the finals in the reel strip.
+// The strip starts at a large negative offset that makes these randoms visible;
+// the CSS transition then slides the strip DOWN until y=0 reveals the finals.
+const RANDOM_ROWS = 14; // 14 rows × 3 symbols = 42 extra symbols per reel
+
+// Starting translateY: positions the strip so the bottom randoms fill the window.
+// Strip layout (top → bottom): [final0, final1, final2, rand_0 … rand_(N-1)]
+// translateY(0)          → window sees final0/final1/final2 (landing position)
+// translateY(START_Y)    → window sees the last 3 randoms   (spin start)
+const START_Y = -(RANDOM_ROWS * 3 * STEP); // e.g. -(14 × 3 × 74) = -3108 px
+
+// Per-reel CSS transition durations (ms). Reel 0 stops first, reel 4 last,
+// producing a natural cascading "one by one" stop sequence.
+const REEL_DURATIONS = [1200, 1500, 1800, 2100, 2400] as const;
+
+// Strong ease-out curve: starts very fast (slot-machine blur), decelerates
+// smoothly to rest with no bounce.
+const EASING = 'cubic-bezier(0.22, 1, 0.36, 1)';
 
 interface ReelGridProps {
   grid: ReelGridType;
@@ -29,27 +42,24 @@ function randSym(reel: number): SymbolId {
   return strip[Math.floor(Math.random() * strip.length)];
 }
 
-type Phase = 'idle' | 'spinning' | 'sliding' | 'done';
+type Phase = 'idle' | 'sliding' | 'done';
 
 interface ReelState {
   phase: Phase;
-  /** Current symbols shown during rapid-spin phase */
-  spinSymbols: SymbolId[];
-  /** 6-symbol strip for the slide phase: [rand0,rand1,rand2, final0,final1,final2] */
-  stripSymbols: SymbolId[];
-  /** Current CSS translateY value for the strip */
-  stripY: number;
-  /** Whether the 1-second CSS transition is active */
-  stripTransition: boolean;
+  /** Full strip: [final0, final1, final2, ...randoms] */
+  strip: SymbolId[];
+  /** Current CSS translateY in px */
+  y: number;
+  /** CSS transition string — 'none' for instant repositioning */
+  transition: string;
 }
 
 function makeIdle(grid: ReelGridType, reel: number): ReelState {
   return {
     phase: 'idle',
-    spinSymbols: grid[reel],
-    stripSymbols: [...grid[reel], ...grid[reel]],
-    stripY: 0,
-    stripTransition: false,
+    strip: grid[reel],
+    y: 0,
+    transition: 'none',
   };
 }
 
@@ -63,29 +73,19 @@ export default function ReelGrid({
   const [reels, setReels] = useState<ReelState[]>(() =>
     Array.from({ length: 5 }, (_, i) => makeIdle(grid, i))
   );
-
-  const intervals = useRef<(ReturnType<typeof setInterval> | null)[]>([
-    null, null, null, null, null,
-  ]);
   const timeouts = useRef<ReturnType<typeof setTimeout>[]>([]);
-  /** Stores the most-recent random symbols so the stop handler can capture them */
-  const lastSpinSyms = useRef<SymbolId[][]>(
-    Array.from({ length: 5 }, (_, i) => [...grid[i]])
-  );
 
   // Build the set of winning cell positions for highlighting
   const winPositions = new Set<string>();
   if (showingWins) {
     winLines.forEach(wl =>
-      wl.positions.forEach(([reel, row]) => winPositions.add(`${reel}-${row}`))
+      wl.positions.forEach(([r, row]) => winPositions.add(`${r}-${row}`))
     );
   }
 
   useEffect(() => {
-    // Clean up any running timers from a previous spin
-    intervals.current.forEach(t => t != null && clearInterval(t));
-    timeouts.current.forEach(t => clearTimeout(t));
-    intervals.current = [null, null, null, null, null];
+    // Cancel any in-flight timers from a previous spin
+    timeouts.current.forEach(clearTimeout);
     timeouts.current = [];
 
     if (!spinning) {
@@ -93,99 +93,58 @@ export default function ReelGrid({
       return;
     }
 
-    // ── Kick off all reels into the spinning phase ──────────────────────────
+    // ── Step 1: Instantly jump all reels to START_Y (no transition) ──────────
+    // Each strip has the final symbols at the top and random symbols below.
+    // translateY(START_Y) makes the window show the bottom randoms.
     setReels(
-      Array.from({ length: 5 }, (_, i) => {
-        const s = [randSym(i), randSym(i), randSym(i)];
-        lastSpinSyms.current[i] = s;
-        return {
-          phase: 'spinning' as Phase,
-          spinSymbols: s,
-          stripSymbols: [...s, ...grid[i]],
-          stripY: 0,
-          stripTransition: false,
-        };
-      })
+      Array.from({ length: 5 }, (_, r) => ({
+        phase: 'sliding' as Phase,
+        strip: [
+          ...grid[r],
+          ...Array.from({ length: RANDOM_ROWS * 3 }, () => randSym(r)),
+        ],
+        y: START_Y,
+        transition: 'none',
+      }))
     );
 
+    // ── Step 2: After one render cycle, start each reel's CSS transition ─────
+    // All reels begin sliding simultaneously but each has a different duration,
+    // so they stop one by one in a natural cascade.
+    const t1 = setTimeout(() => {
+      setReels(prev =>
+        prev.map((s, i) => ({
+          ...s,
+          y: 0, // slide the strip DOWN until finals (top of strip) are visible
+          transition: `transform ${REEL_DURATIONS[i]}ms ${EASING}`,
+        }))
+      );
+    }, 30); // single rAF-equivalent delay so the initial position is committed
+    timeouts.current.push(t1);
+
+    // ── Step 3: Mark each reel done after its transition completes ───────────
     for (let r = 0; r < 5; r++) {
-      const reel = r; // closure capture
-
-      // Rapid random-symbol swap — creates the "blur" spin look
-      intervals.current[reel] = setInterval(() => {
-        const s = [randSym(reel), randSym(reel), randSym(reel)];
-        lastSpinSyms.current[reel] = s;
-        setReels(prev => {
-          const next = [...prev];
-          next[reel] = { ...next[reel], spinSymbols: s };
-          return next;
-        });
-      }, 60);
-
-      // ── Stop each reel with a cascading delay ─────────────────────────────
-      const stopAt = 600 + reel * 300; // ms from spin start
-
-      const t1 = setTimeout(() => {
-        // Stop the rapid-change interval
-        if (intervals.current[reel] != null) {
-          clearInterval(intervals.current[reel]!);
-          intervals.current[reel] = null;
-        }
-
-        // Capture the last random symbols for the top half of the slide strip
-        const randSyms = lastSpinSyms.current[reel];
-
-        // Strip: [rand0, rand1, rand2, final0, final1, final2]
-        // Start with translateY(0) so the random symbols fill the visible window
-        setReels(prev => {
-          const next = [...prev];
-          next[reel] = {
-            phase: 'sliding',
-            spinSymbols: randSyms,
-            stripSymbols: [...randSyms, ...grid[reel]],
-            stripY: 0,          // show randoms (top of strip)
-            stripTransition: false,
-          };
-          return next;
-        });
-
-        // After one render cycle, enable the 1-second ease-out transition and
-        // animate to translateY(-SLIDE_Y) to reveal the final symbols
-        const t2 = setTimeout(() => {
+      const t = setTimeout(
+        () => {
           setReels(prev => {
             const next = [...prev];
-            next[reel] = {
-              ...next[reel],
-              stripY: -SLIDE_Y,     // final position showing result symbols
-              stripTransition: true, // activate CSS 1s ease-out
-            };
+            next[r] = { ...next[r], phase: 'done', transition: 'none' };
             return next;
           });
-        }, 30); // small delay so the initial render is committed first
-        timeouts.current.push(t2);
-
-        // Mark the reel as done once the transition finishes
-        const t3 = setTimeout(() => {
-          setReels(prev => {
-            const next = [...prev];
-            next[reel] = { ...next[reel], phase: 'done', stripTransition: false };
-            return next;
-          });
-        }, 30 + 1050); // 30 ms render + 1000 ms transition + 50 ms buffer
-        timeouts.current.push(t3);
-      }, stopAt);
-      timeouts.current.push(t1);
+        },
+        30 + REEL_DURATIONS[r] + 50 // render delay + transition + small buffer
+      );
+      timeouts.current.push(t);
     }
 
-    // Fire onSpinComplete after all reels have finished their 1-second slide
-    // Last reel stops at 600 + 4×300 = 1800 ms, then 30 + 1050 = 1080 ms later → 2880 ms
-    const allDone = setTimeout(() => onSpinComplete?.(), 1800 + 1080 + 50);
-    timeouts.current.push(allDone);
+    // ── Step 4: Notify parent when all reels have landed ────────────────────
+    const tDone = setTimeout(
+      () => onSpinComplete?.(),
+      30 + Math.max(...REEL_DURATIONS) + 100
+    );
+    timeouts.current.push(tDone);
 
-    return () => {
-      intervals.current.forEach(t => t != null && clearInterval(t));
-      timeouts.current.forEach(t => clearTimeout(t));
-    };
+    return () => timeouts.current.forEach(clearTimeout);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [spinning, grid]);
 
@@ -204,40 +163,7 @@ export default function ReelGrid({
         {[0, 1, 2, 3, 4].map(reel => {
           const state = reels[reel];
 
-          // ── Spinning phase: rapid random symbols, slightly faded ────────────
-          if (state.phase === 'spinning') {
-            return (
-              <div
-                key={reel}
-                style={{
-                  height: `${VISIBLE_H}px`,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: `${GAP}px`,
-                }}
-              >
-                {[0, 1, 2].map(row => (
-                  <div
-                    key={row}
-                    className="relative flex items-center justify-center rounded-lg overflow-hidden"
-                    style={{
-                      height: `${ROW_HEIGHT}px`,
-                      background: 'rgba(10, 10, 40, 0.6)',
-                      border: '1px solid rgba(255, 215, 0, 0.15)',
-                      opacity: 0.65,
-                    }}
-                  >
-                    <SymbolDisplay
-                      symbol={state.spinSymbols[row] ?? '9'}
-                      highlighted={false}
-                    />
-                  </div>
-                ))}
-              </div>
-            );
-          }
-
-          // ── Sliding phase: strip animates from randoms → finals ─────────────
+          // ── Sliding phase: animated strip scrolls DOWN to reveal finals ──────
           if (state.phase === 'sliding') {
             return (
               <div
@@ -250,18 +176,15 @@ export default function ReelGrid({
               >
                 <div
                   style={{
-                    transform: `translateY(${state.stripY}px)`,
-                    transition: state.stripTransition
-                      ? 'transform 1s ease-out'
-                      : 'none',
+                    transform: `translateY(${state.y}px)`,
+                    transition: state.transition,
                   }}
                 >
-                  {state.stripSymbols.map((symbol, idx) => {
-                    // Indices 3-5 are the final result symbols
-                    const isFinal = idx >= 3;
-                    const finalRow = idx - 3;
+                  {state.strip.map((symbol, idx) => {
+                    // Indices 0-2 are the final result symbols (top of strip)
+                    const isFinal = idx < 3;
                     const isWinning =
-                      isFinal && winPositions.has(`${reel}-${finalRow}`);
+                      isFinal && winPositions.has(`${reel}-${idx}`);
                     return (
                       <div
                         key={idx}
@@ -269,9 +192,7 @@ export default function ReelGrid({
                         style={{
                           height: `${ROW_HEIGHT}px`,
                           marginBottom:
-                            idx < state.stripSymbols.length - 1
-                              ? `${GAP}px`
-                              : '0',
+                            idx < state.strip.length - 1 ? `${GAP}px` : '0',
                           background: isWinning
                             ? 'rgba(255, 215, 0, 0.15)'
                             : 'rgba(10, 10, 40, 0.6)',
@@ -290,7 +211,7 @@ export default function ReelGrid({
             );
           }
 
-          // ── Idle / Done phase: standard 3-cell display ──────────────────────
+          // ── Idle / Done phase: static 3-cell display ─────────────────────────
           const symbols = grid[reel];
           return (
             <div
